@@ -1292,7 +1292,10 @@ class Model:
         v = data.v[:batch_size]
         vJ = data.vJ[:batch_size]
 
-        needs_grad = qdd.requires_grad
+        # Gradient may flow through qdd (d tau/d qdd) or through the cached
+        # configuration/velocity quantities (d tau/d q, d tau/d qd) — the latter
+        # carry grad via Xup/v after a functional update_kinematics.
+        needs_grad = qdd.requires_grad or Xup.requires_grad or v.requires_grad
         if needs_grad:
             a = qdd.new_zeros(batch_size, self.n_frames, 6, 1)
             f = qdd.new_zeros(batch_size, self.n_frames, 6, 1)
@@ -1380,16 +1383,28 @@ class Model:
             ],
             dim=2,
         )
-        f[:] = I_spatial_expanded @ a + fcx
+        if needs_grad:
+            # Autograd-safe path: accumulate per-node forces in a Python list.
+            # Integer-indexed slices (f[:, node_idx]) are views, so an in-place
+            # ``.add_`` would mutate a tensor still needed for the backward of the
+            # bmm that read it, tripping autograd's version counter. Building new
+            # tensors per node (cf. CRBA's Ic_list) keeps every op functional.
+            f_list = list((I_spatial_expanded @ a + fcx).unbind(dim=1))
+            for node_idx in reversed(self._chain.topo_order):
+                for child_idx in self._chain.children_list[node_idx]:
+                    f_list[node_idx] = f_list[node_idx] + Xup_T[:, child_idx] @ f_list[child_idx]
+            f = torch.stack(f_list, dim=1)
+        else:
+            f[:] = I_spatial_expanded @ a + fcx
 
-        # Propagate child forces to parents (per-node, reverse topological order)
-        for node_idx in reversed(self._chain.topo_order):
-            children = self._chain.children_list[node_idx]
-            if len(children) == 1:
-                f[:, node_idx].add_(Xup_T[:, children[0]] @ f[:, children[0]])
-            elif len(children) > 1:
-                for child_idx in children:
-                    f[:, node_idx].add_(Xup_T[:, child_idx] @ f[:, child_idx])
+            # Propagate child forces to parents (per-node, reverse topological order)
+            for node_idx in reversed(self._chain.topo_order):
+                children = self._chain.children_list[node_idx]
+                if len(children) == 1:
+                    f[:, node_idx].add_(Xup_T[:, children[0]] @ f[:, children[0]])
+                elif len(children) > 1:
+                    for child_idx in children:
+                        f[:, node_idx].add_(Xup_T[:, child_idx] @ f[:, child_idx])
 
         # Extract generalized forces
         tau = qdd.new_zeros(batch_size, self.nv)
@@ -1587,7 +1602,10 @@ class Model:
         v = data.v
         cached_vJ = data.vJ
 
-        needs_grad = tau.requires_grad
+        # Gradient may flow through tau (d qdd/d tau) or through the cached
+        # configuration/velocity quantities (d qdd/d q, d qdd/d qd) — the latter
+        # carry grad via Xup/v after a functional update_kinematics.
+        needs_grad = tau.requires_grad or Xup.requires_grad or v.requires_grad
         I_spatial_batched = self.I_spatial.unsqueeze(0).expand(batch_size, -1, -1, -1)
 
         if needs_grad:
@@ -1664,56 +1682,114 @@ class Model:
             )
 
         # ---- Pass 2: Backward — accumulate articulated body inertia (per-node) ----
-        use_triton = Xup.is_cuda and self._use_triton_kernels and not tau.requires_grad
-        for node_idx in reversed(self._chain.topo_order):
-            j_idx = self._chain.joint_indices_list[node_idx]
-            p_idx = self._chain.parent_list[node_idx]
-            is_actuated = self._is_actuated[node_idx]
+        use_triton = Xup.is_cuda and self._use_triton_kernels and not needs_grad
+        if needs_grad:
+            # Autograd-safe path: accumulate per-node quantities in Python lists.
+            # Integer-indexed slices (IA[:, p_idx], pA[:, p_idx]) are views, so an
+            # in-place ``.add_`` would mutate a tensor still needed by the backward
+            # of the matmul that read it. Building new tensors per node (cf. CRBA's
+            # Ic_list) keeps every op functional; quantities are stacked afterwards
+            # so the forward pass below is unchanged.
+            IA_list = list(IA.unbind(dim=1))
+            pA_list = list(pA.unbind(dim=1))
+            U_list = list(U.unbind(dim=1))
+            d_list = list(d.unbind(dim=1))
+            u_list = list(u.unbind(dim=1))
+            for node_idx in reversed(self._chain.topo_order):
+                j_idx = self._chain.joint_indices_list[node_idx]
+                p_idx = self._chain.parent_list[node_idx]
+                Xup_node = Xup[:batch_size, node_idx]
+                Xup_i_T = data.Xup_T[:batch_size, node_idx]
 
-            if is_actuated:
-                S_i = S[:batch_size, node_idx]
-                IA_i = IA[:, node_idx]
+                if self._is_actuated[node_idx]:
+                    S_i = S[:batch_size, node_idx]
+                    IA_i = IA_list[node_idx]
 
-                U_i = IA_i @ S_i
-                U[:, node_idx] = U_i
-                d_i = (S_i.transpose(1, 2) @ U_i).squeeze(-1).squeeze(-1)
-                d[:, node_idx] = d_i
+                    U_i = IA_i @ S_i
+                    U_list[node_idx] = U_i
+                    d_i = (S_i.transpose(1, 2) @ U_i).squeeze(-1).squeeze(-1)
+                    d_list[node_idx] = d_i
 
-                u_i = tau_joints[:, j_idx] - (S_i.transpose(1, 2) @ pA[:, node_idx]).squeeze(
-                    -1
-                ).squeeze(-1)
-                u[:, node_idx] = u_i
+                    u_i = tau_joints[:, j_idx] - (
+                        S_i.transpose(1, 2) @ pA_list[node_idx]
+                    ).squeeze(-1).squeeze(-1)
+                    u_list[node_idx] = u_i
 
-                d_safe = d_i.clamp(min=1e-12)
-                d_inv = d_safe.reciprocal().unsqueeze(-1).unsqueeze(-1)
-                Ia = IA_i - U_i @ U_i.transpose(1, 2) * d_inv
-                pa = (
-                    pA[:, node_idx]
-                    + Ia @ c[:, node_idx]
-                    + U_i * (u_i * d_safe.reciprocal()).unsqueeze(-1).unsqueeze(-1)
-                )
+                    d_safe = d_i.clamp(min=1e-12)
+                    d_inv = d_safe.reciprocal().unsqueeze(-1).unsqueeze(-1)
+                    Ia = IA_i - U_i @ U_i.transpose(1, 2) * d_inv
+                    pa = (
+                        pA_list[node_idx]
+                        + Ia @ c[:, node_idx]
+                        + U_i * (u_i * d_safe.reciprocal()).unsqueeze(-1).unsqueeze(-1)
+                    )
 
-                if p_idx != -1:
-                    Xup_i_T = data.Xup_T[:batch_size, node_idx]
-                    if use_triton:
-                        fused_xtmx_add(Xup_i_T, Ia, Xup[:batch_size, node_idx], IA[:, p_idx])
-                    else:
-                        IA[:, p_idx].add_(Xup_i_T @ Ia @ Xup[:batch_size, node_idx])
-                    pA[:, p_idx].add_(Xup_i_T @ pa)
-            else:
-                # Fixed joint: propagate IA and pA upward
-                if p_idx != -1:
-                    Xup_i_T = data.Xup_T[:batch_size, node_idx]
-                    if use_triton:
-                        fused_xtmx_add(
-                            Xup_i_T,
-                            IA[:, node_idx],
-                            Xup[:batch_size, node_idx],
-                            IA[:, p_idx],
+                    if p_idx != -1:
+                        IA_list[p_idx] = IA_list[p_idx] + Xup_i_T @ Ia @ Xup_node
+                        pA_list[p_idx] = pA_list[p_idx] + Xup_i_T @ pa
+                else:
+                    # Fixed joint: propagate IA and pA upward
+                    if p_idx != -1:
+                        IA_list[p_idx] = (
+                            IA_list[p_idx] + Xup_i_T @ IA_list[node_idx] @ Xup_node
                         )
-                    else:
-                        IA[:, p_idx].add_(Xup_i_T @ IA[:, node_idx] @ Xup[:batch_size, node_idx])
-                    pA[:, p_idx].add_(Xup_i_T @ pA[:, node_idx])
+                        pA_list[p_idx] = pA_list[p_idx] + Xup_i_T @ pA_list[node_idx]
+
+            IA = torch.stack(IA_list, dim=1)
+            pA = torch.stack(pA_list, dim=1)
+            U = torch.stack(U_list, dim=1)
+            d = torch.stack(d_list, dim=1)
+            u = torch.stack(u_list, dim=1)
+        else:
+            for node_idx in reversed(self._chain.topo_order):
+                j_idx = self._chain.joint_indices_list[node_idx]
+                p_idx = self._chain.parent_list[node_idx]
+                is_actuated = self._is_actuated[node_idx]
+
+                if is_actuated:
+                    S_i = S[:batch_size, node_idx]
+                    IA_i = IA[:, node_idx]
+
+                    U_i = IA_i @ S_i
+                    U[:, node_idx] = U_i
+                    d_i = (S_i.transpose(1, 2) @ U_i).squeeze(-1).squeeze(-1)
+                    d[:, node_idx] = d_i
+
+                    u_i = tau_joints[:, j_idx] - (S_i.transpose(1, 2) @ pA[:, node_idx]).squeeze(
+                        -1
+                    ).squeeze(-1)
+                    u[:, node_idx] = u_i
+
+                    d_safe = d_i.clamp(min=1e-12)
+                    d_inv = d_safe.reciprocal().unsqueeze(-1).unsqueeze(-1)
+                    Ia = IA_i - U_i @ U_i.transpose(1, 2) * d_inv
+                    pa = (
+                        pA[:, node_idx]
+                        + Ia @ c[:, node_idx]
+                        + U_i * (u_i * d_safe.reciprocal()).unsqueeze(-1).unsqueeze(-1)
+                    )
+
+                    if p_idx != -1:
+                        Xup_i_T = data.Xup_T[:batch_size, node_idx]
+                        if use_triton:
+                            fused_xtmx_add(Xup_i_T, Ia, Xup[:batch_size, node_idx], IA[:, p_idx])
+                        else:
+                            IA[:, p_idx].add_(Xup_i_T @ Ia @ Xup[:batch_size, node_idx])
+                        pA[:, p_idx].add_(Xup_i_T @ pa)
+                else:
+                    # Fixed joint: propagate IA and pA upward
+                    if p_idx != -1:
+                        Xup_i_T = data.Xup_T[:batch_size, node_idx]
+                        if use_triton:
+                            fused_xtmx_add(
+                                Xup_i_T,
+                                IA[:, node_idx],
+                                Xup[:batch_size, node_idx],
+                                IA[:, p_idx],
+                            )
+                        else:
+                            IA[:, p_idx].add_(Xup_i_T @ IA[:, node_idx] @ Xup[:batch_size, node_idx])
+                        pA[:, p_idx].add_(Xup_i_T @ pA[:, node_idx])
 
         # ---- Pass 3: Forward — compute accelerations (level-order) ----
         Xup_b = Xup[:batch_size]
@@ -1724,14 +1800,18 @@ class Model:
         if self.has_floating_base:
             # Solve for base acceleration: IA * a = tau_base - pA
             assert tau_base is not None
-            a[:, root_idx] = torch.linalg.solve(
+            a_root = torch.linalg.solve(
                 IA[:, root_idx],
                 tau_base.unsqueeze(-1) - pA[:, root_idx],
             )
+            a[:, root_idx] = a_root
 
-            # Extract qdd_base: transform a back to node 0 frame, subtract gravity
+            # Extract qdd_base: transform a back to node 0 frame, subtract gravity.
+            # Use a_root directly (not a re-read of a[:, root_idx]): on the autograd
+            # path the integer-indexed read is a view that the later in-place writes
+            # to ``a`` would invalidate.
             inv_Xup_root = spatial_adjoint_fast(data.T_pc[:batch_size, root_idx])
-            a_in_node0 = inv_Xup_root @ a[:, root_idx]
+            a_in_node0 = inv_Xup_root @ a_root
             qdd_out[:, :6] = (a_in_node0 - a_gravity_base).squeeze(-1)
 
         for (
