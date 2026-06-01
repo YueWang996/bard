@@ -175,13 +175,15 @@ pytest
 If you use `bard` in your research, please consider citing it:
 
 ```bibtex
-@software{wang_2025_bard,
-  author       = {Wang, Yue},
-  title        = {{bard: Batched Articulated Robot Dynamics}},
-  month        = oct,
-  year         = {2025},
-  doi          = {10.5281/zenodo.17291122},
-  url          = {https://github.com/YueWang996/bard}
+@inproceedings{wang2026batched,
+  title         = {Batched Differentiable Rigid Body Dynamics in PyTorch for GPU-Accelerated Robot Learning},
+  author        = {Wang, Yue and Xu, Yanran and Wu, Wenbo and Qiu, Chuanhang and Li, Zhaoxing},
+  booktitle     = {International Conference on Artificial Neural Networks (ICANN)},
+  year          = {2026},
+  publisher     = {Springer},
+  eprint        = {2605.31481},
+  archivePrefix = {arXiv},
+  url           = {https://arxiv.org/abs/2605.31481}
 }
 ```
 
