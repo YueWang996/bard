@@ -3,7 +3,7 @@
 [![CI](https://github.com/YueWang996/bard/actions/workflows/ci.yml/badge.svg)](https://github.com/YueWang996/bard/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Version](https://img.shields.io/badge/version-0.4.1-blue.svg)](https://github.com/YueWang996/bard)
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17291122.svg)](https://doi.org/10.5281/zenodo.17291122)
+[![arXiv](https://img.shields.io/badge/arXiv-2605.31481-b31b1b.svg)](https://arxiv.org/abs/2605.31481)
 
 <p align="center">
   <img src="cover.png" alt="bard cover" width="800"/>
