@@ -198,7 +198,9 @@ def hat_inv(h):
     if dim1 != 3 or dim2 != 3:
         raise ValueError("Input has to be a batch of 3x3 Tensors.")
 
-    ss_diff = (h + h.permute(0, 2, 1)).abs().max()
+    # Validation guard only — detach before the scalar read so it does not warn
+    # (or interfere) when ``h`` carries grad (e.g. so3_log_map on a grad path).
+    ss_diff = (h + h.permute(0, 2, 1)).abs().max().detach()
     if float(ss_diff) > HAT_INV_SKEW_SYMMETRIC_TOL:
         raise ValueError("One of input matrices not skew-symmetric.")
 
